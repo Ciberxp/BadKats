@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Kat Wars | Arena PvP</title>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser-arcade-physics.min.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        :root { --primary: #00f2ff; --danger: #ff4757; }
+        body, html { margin: 0; padding: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; color: white; }
+        
+        /* Pantalla de Inicio */
+        .overlay { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; background: radial-gradient(circle, #1a1a2e, #000); }
+        .login-card { background: rgba(0,0,0,0.85); padding: 40px; border-radius: 20px; border: 1px solid var(--primary); text-align: center; width: 320px; backdrop-filter: blur(10px); }
+        input, select, button { width: 100%; padding: 12px; margin: 10px 0; border-radius: 10px; border: none; font-size: 16px; box-sizing: border-box; }
+        input { background: #111; color: white; border: 1px solid #333; }
+        button { background: var(--primary); color: #000; font-weight: bold; cursor: pointer; text-transform: uppercase; transition: 0.3s; }
+        button:hover { background: white; transform: scale(1.05); }
+
+        /* Pantalla de Muerte */
+        #death-screen { background: rgba(100, 0, 0, 0.85); z-index: 200; text-align: center; pointer-events: none; }
+        #death-screen h1 { font-size: 4rem; margin: 0; color: #ff9f43; text-shadow: 0 0 20px black; }
+        #respawn-timer { font-size: 6rem; font-weight: bold; color: white; }
+
+        /* HUD e Interfaz */
+        #hud { position: absolute; bottom: 20px; left: 20px; z-index: 50; }
+        .hp-container { width: 280px; height: 15px; background: #222; border: 2px solid white; border-radius: 10px; overflow: hidden; }
+        #hp-fill { width: 100%; height: 100%; background: #2ecc71; transition: 0.3s; }
+        #kill-feed { position: absolute; top: 20px; right: 20px; z-index: 60; text-align: right; }
+        .kill-msg { background: rgba(0,0,0,0.7); padding: 8px 15px; margin-bottom: 5px; border-radius: 5px; border-right: 4px solid var(--danger); animation: slide 0.3s; }
+        
+        @keyframes slide { from { transform: translateX(50px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+
+    <div id="hud" class="hidden">
+        <div style="margin-bottom: 5px; font-size: 12px; font-weight: bold;">SALUD DEL KAT</div>
+        <div class="hp-container"><div id="hp-fill"></div></div>
+    </div>
+
+    <div id="kill-feed"></div>
+
+    <div id="death-screen" class="overlay hidden">
+        <h1>¡HAS CAÍDO!</h1>
+        <p>Reapareciendo en...</p>
+        <div id="respawn-timer">3</div>
+    </div>
+
+    <div id="login-screen" class="overlay">
+        <img src="assets/titulo.png" style="max-width: 80%; margin-bottom: 20px;" onerror="this.style.display='none'">
+        <div class="login-card">
+            <h2 style="margin-top:0">KAT WARS PvP</h2>
+            <input type="text" id="username" placeholder="Nombre..." maxlength="12">
+            <select id="kat-color">
+                <option value="rojo">🔴 Rojo</option><option value="rosa">💖 Rosa</option>
+                <option value="verde">🟢 Verde</option><option value="negro">⚫ Negro</option>
+                <option value="naranja">🟠 Naranja</option><option value="morado">🟣 Morado</option>
+                <option value="celeste">🩵 Celeste</option><option value="blanco">⚪ Blanco</option>
+                <option value="azul">🔵 Azul</option><option value="amarillo">🟡 Amarillo</option>
+            </select>
+            <button onclick="entrar()">ENTRAR A LA ARENA</button>
+        </div>
+    </div>
+
+    <div id="game-container" class="hidden"></div>
+
+    <script>
+        let socket, myKat, wasd, bullets, otherKats = {}, customCursor;
+
+        function entrar() {
+            if(!document.getElementById('username').value.trim()) return alert("¡Escribe un nombre!");
+            document.getElementById('login-screen').classList.add('hidden');
+            document.getElementById('game-container').classList.remove('hidden');
+            document.getElementById('hud').classList.remove('hidden');
+            new Phaser.Game(config);
+        }
+
+        const config = {
+            type: Phaser.AUTO,
+            parent: 'game-container',
+            width: window.innerWidth,
+            height: window.innerHeight,
+            physics: { default: 'arcade', arcade: { gravity: { y: 0 } } },
+            scene: { preload: preload, create: create, update: update }
+        };
+
+        function preload() {
+            const colores = ['rojo','rosa','verde','negro','naranja','morado','celeste','blanco','azul','amarillo'];
+            colores.forEach(c => this.load.image(`kat-${c}`, `assets/kats/kat-${c}.png`));
+            this.load.image('bullet', 'assets/bullet.png');
+            this.load.image('cursor', 'assets/cursor.png');
+        }
+
+        function create() {
+            const self = this;
+            socket = io();
+            this.physics.world.setBounds(0, 0, 2000, 2000);
+            this.add.grid(1000, 1000, 2000, 2000, 64, 64, 0x111111).setAltFillStyle(0x0a0a0a).setOutlineStyle(0xffffff, 0.05);
+
+            bullets = this.physics.add.group();
+            wasd = this.input.keyboard.addKeys('W,A,S,D');
+            this.input.setDefaultCursor('none');
+            customCursor = this.add.image(0,0,'cursor').setDepth(1000).setScrollFactor(0);
+
+            socket.emit('joinGame', { 
+                name: document.getElementById('username').value, 
+                color: document.getElementById('kat-color').value 
+            });
+
+            socket.on('currentPlayers', (ps) => {
+                Object.keys(ps).forEach(id => {
+                    if (id === socket.id) addPlayer(self, ps[id]);
+                    else addOtherPlayer(self, ps[id]);
+                });
+            });
+
+            socket.on('newPlayer', (info) => addOtherPlayer(self, info));
+            
+            socket.on('playerMoved', (info) => {
+                if (otherKats[info.id]) {
+                    otherKats[info.id].setPosition(info.x, info.y);
+                    otherKats[info.id].setVisible(!info.isDead); // Ocultar si está muerto
+                }
+            });
+
+            socket.on('updateEnemyHealth', (data) => {
+                if (otherKats[data.id]) otherKats[data.id].hpFill.width = (data.health / 100) * 50;
+            });
+
+            socket.on('updateLocalHealth', (hp) => {
+                document.getElementById('hp-fill').style.width = hp + "%";
+            });
+
+            socket.on('youDied', (data) => {
+                const ds = document.getElementById('death-screen');
+                const timer = document.getElementById('respawn-timer');
+                ds.classList.remove('hidden');
+                myKat.setVisible(false);
+                
+                let count = data.cooldown;
+                timer.innerText = count;
+                const clock = setInterval(() => {
+                    count--;
+                    timer.innerText = count;
+                    if(count <= 0) {
+                        clearInterval(clock);
+                        ds.classList.add('hidden');
+                    }
+                }, 1000);
+            });
+
+            socket.on('respawn', (info) => {
+                myKat.setPosition(info.x, info.y);
+                myKat.setVisible(true);
+                document.getElementById('hp-fill').style.width = "100%";
+            });
+
+            socket.on('killMessage', (data) => {
+                const feed = document.getElementById('kill-feed');
+                const div = document.createElement('div');
+                div.className = 'kill-msg';
+                div.innerHTML = `⚔️ <b>${data.attacker}</b> eliminó a <b>${data.victim}</b>`;
+                feed.appendChild(div);
+                setTimeout(() => div.remove(), 4000);
+            });
+
+            socket.on('playerDisconnected', (id) => {
+                if (otherKats[id]) { otherKats[id].destroy(); delete otherKats[id]; }
+            });
+
+            this.input.on('pointerdown', (p) => {
+                if (!myKat || !myKat.visible) return;
+                socket.emit('playerShoot');
+                const b = bullets.create(myKat.x, myKat.y, 'bullet');
+                const angle = Phaser.Math.Angle.Between(myKat.x, myKat.y, p.worldX, p.worldY);
+                this.physics.velocityFromRotation(angle, 900, b.body.velocity);
+                this.time.delayedCall(1200, () => { if(b.active) b.destroy(); });
+                
+                Object.keys(otherKats).forEach(id => {
+                    this.physics.add.overlap(b, otherKats[id], () => {
+                        socket.emit('playerHit', { id: id });
+                        b.destroy();
+                    });
+                });
+            });
+        }
+
+        function update() {
+            if(customCursor) customCursor.setPosition(this.input.mousePointer.x, this.input.mousePointer.y);
+            if (!myKat || !myKat.visible) return;
+
+            myKat.body.setVelocity(0);
+            if (wasd.A.isDown) myKat.body.setVelocityX(-450);
+            else if (wasd.D.isDown) myKat.body.setVelocityX(450);
+            if (wasd.W.isDown) myKat.body.setVelocityY(-450);
+            else if (wasd.S.isDown) myKat.body.setVelocityY(450);
+
+            if (myKat.x !== myKat.oldX || myKat.y !== myKat.oldY) {
+                socket.emit('playerMovement', { x: myKat.x, y: myKat.y });
+            }
+            myKat.oldX = myKat.x; myKat.oldY = myKat.y;
+        }
+
+        function addPlayer(self, info) {
+            myKat = self.physics.add.image(info.x, info.y, `kat-${info.color}`).setOrigin(0.5);
+            myKat.setCollideWorldBounds(true);
+            self.cameras.main.startFollow(myKat, true, 0.1, 0.1);
+        }
+
+        function addOtherPlayer(self, info) {
+            const container = self.add.container(info.x, info.y);
+            self.physics.add.existing(container);
+            container.body.setSize(70, 70);
+            
+            const sprite = self.add.image(0, 0, `kat-${info.color}`).setOrigin(0.5);
+            const txt = self.add.text(0, -65, info.name, { fontSize: '14px', color: '#fff', backgroundColor: 'rgba(0,0,0,0.8)', padding: 3 }).setOrigin(0.5);
+            const hbBg = self.add.rectangle(0, -48, 50, 6, 0x000000);
+            const hbFill = self.add.rectangle(-25, -48, 50, 6, 0x2ecc71).setOrigin(0, 0.5);
+
+            container.add([sprite, txt, hbBg, hbFill]);
+            container.hpFill = hbFill;
+            container.setVisible(!info.isDead);
+            otherKats[info.id] = container;
+        }
+    </script>
+</body>
+</html>
